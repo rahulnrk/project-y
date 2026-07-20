@@ -44,7 +44,10 @@ class SafetyGuardrailProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TranscriptionFrame) and frame.finalized and frame.text.strip():
+        # Do NOT gate on frame.finalized -- Sarvam STT never sets it (always
+        # False), which would make every rule below dead code. Sarvam emits a
+        # TranscriptionFrame only on a final "data" message.
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             text = frame.text.strip()
             result = classify_safety(text)
 

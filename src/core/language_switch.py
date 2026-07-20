@@ -53,11 +53,20 @@ _LABELS = {
     "en-IN": "English",
 }
 
+# The one-shot greeting cue pipeline.py injects on connect. It is a *user*
+# message, so it must be scrubbed by role="user" handling below -- and both
+# pipeline.py and this module must agree on the exact string. Previously the
+# cue read "(Call connected." while the scrub list said "(Call just connected",
+# so it never matched: the cue survived every turn and the model kept re-reading
+# "ask my name casually" as something the caller had just said. That is what
+# produced the mid-call repetition and re-introductions.
+CALL_CUE_PREFIX = "(Call connected."
+
 _EPHEMERAL_PREFIXES = (
     "LANGUAGE SWITCH:",
     "ONE short",
     "REAL TIME NOW",
-    "(Call just connected",
+    CALL_CUE_PREFIX,
 )
 
 
@@ -70,13 +79,26 @@ def detect_language_request(text: str) -> Optional[str]:
     return None
 
 
-def _scrub_ephemeral_system(messages: list) -> list:
+def _scrub_ephemeral(messages: list) -> list:
+    """Drop one-shot injects so they never accumulate in context.
+
+    Handles both roles: short system injects (language-switch notes, time
+    blobs) and the user-role greeting cue. Only the long base system prompt
+    is preserved.
+    """
     cleaned = []
     for m in messages:
-        if m.get("role") != "system":
+        role = m.get("role")
+        content = m.get("content") or ""
+
+        # User-role greeting cue: always ephemeral, drop on sight.
+        if role == "user" and content.startswith(CALL_CUE_PREFIX):
+            continue
+
+        if role != "system":
             cleaned.append(m)
             continue
-        content = m.get("content") or ""
+
         if any(content.startswith(p) or p in content[:40] for p in _EPHEMERAL_PREFIXES):
             # Keep the main base system prompt (long); drop short injects
             if len(content) < 400:
@@ -119,7 +141,7 @@ class LanguageSwitchProcessor(FrameProcessor):
         self._current = profile.language or "hi-IN"
 
     def _rewrite_context(self, extra_system: str | None = None):
-        msgs = _scrub_ephemeral_system(list(self._context.get_messages()))
+        msgs = _scrub_ephemeral(list(self._context.get_messages()))
         msgs = _trim_history(msgs, max_turns=8)
         if extra_system:
             msgs.append({"role": "system", "content": extra_system})

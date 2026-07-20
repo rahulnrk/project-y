@@ -29,7 +29,13 @@ class SafetyGuardrailProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, TranscriptionFrame) and frame.finalized and frame.text.strip():
+        # NOTE: do NOT gate on frame.finalized. Sarvam's STT constructs
+        # TranscriptionFrame without ever passing finalized=True (see
+        # pipecat/services/sarvam/stt.py), so it always defaults to False and
+        # this branch never ran -- safety was silently dead on every call.
+        # Sarvam only emits a TranscriptionFrame on a final "data" message,
+        # so every frame reaching here is already an utterance-final result.
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
             text = frame.text.strip()
 
             # Run safety checks concurrently (non-blocking)

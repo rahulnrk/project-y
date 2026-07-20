@@ -9,6 +9,7 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -37,7 +38,7 @@ from ..guardrails.processor import SafetyGuardrailProcessor
 from ..memory.memory_store import MemoryStore, summarize_call
 from ..utils.latency_tracker import LatencyTracker
 from ..utils.prompt_manager import get_prompt
-from .language_switch import LanguageSwitchProcessor
+from .language_switch import CALL_CUE_PREFIX, LanguageSwitchProcessor
 from .transcript_filter import TranscriptFilter
 from .utterance_buffer import FullUtteranceBuffer
 
@@ -98,6 +99,18 @@ async def build_b2c_pipeline(
 
     serializer = ExotelFrameSerializer(stream_sid=stream_sid, call_sid=call_sid)
 
+    # VAD must be handed to the transport params. Constructing the analyzer
+    # alone does nothing: without it here the transport never emits
+    # User{Started,Stopped}SpeakingFrame, so interruptions never fire and the
+    # caller cannot barge in (it reads as an answering machine).
+    #
+    # stop_secs is deliberately longer than the pipecat default (~0.8s):
+    # Hindi/Telugu speakers pause mid-sentence, and aggressive silence-based
+    # endpointing cuts them off. Tune this first if callers get clipped.
+    vad_analyzer = SileroVADAnalyzer(
+        params=VADParams(stop_secs=1.1, start_secs=0.2, confidence=0.7)
+    )
+
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -106,10 +119,10 @@ async def build_b2c_pipeline(
             audio_out_enabled=True,
             add_wav_header=False,
             audio_out_10ms_chunks=8,
+            vad_analyzer=vad_analyzer,
         ),
     )
 
-    _vad = SileroVADAnalyzer()
     aiohttp_session = aiohttp.ClientSession()
 
     # hi-IN + codemix is far more stable than language=unknown (which mis-tagged
@@ -203,15 +216,17 @@ async def build_b2c_pipeline(
     async def on_client_connected(transport, client):
         logger.info(f"Caller connected: {phone_number}")
         # One-shot user cue — ChatGPT-Voice style natural open, not sticky system rule
+        # Both branches MUST start with CALL_CUE_PREFIX so LanguageSwitchProcessor
+        # can scrub this one-shot cue out of context after the first turn.
         if not profile.name or profile.total_calls <= 1:
             cue = (
-                "(Call connected. Open like ChatGPT Voice: warm natural Hindi, one fluid line — "
+                f"{CALL_CUE_PREFIX} Open like ChatGPT Voice: warm natural Hindi, one fluid line — "
                 "you're Sahaay, ask my name casually. Sound human, not IVR. Never re-introduce later.)"
             )
         else:
             name = profile.name or "dost"
             cue = (
-                f"(Call connected. Open like ChatGPT Voice: warm natural Hindi greeting for {name}, "
+                f"{CALL_CUE_PREFIX} Open like ChatGPT Voice: warm natural Hindi greeting for {name}, "
                 f"one fluid line, ready to listen. Human, not IVR. No re-intro later.)"
             )
         context.add_message({"role": "user", "content": cue})
@@ -234,7 +249,7 @@ async def build_b2c_pipeline(
         f"{m.get('role')}: {m.get('content')}"
         for m in context.get_messages()
         if m.get("role") in ("user", "assistant")
-        and not str(m.get("content", "")).startswith("(Call just connected")
+        and not str(m.get("content", "")).startswith(CALL_CUE_PREFIX)
     )
     if not full_transcript.strip():
         return
