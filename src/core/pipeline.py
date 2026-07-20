@@ -98,6 +98,15 @@ def _build_system_prompt(profile) -> str:
         "asks you to repeat: apologise ONCE in your own words, then actually "
         "repeat your last point more slowly and clearly. Never reply with the "
         "same apology twice -- that is what makes you sound broken. "
+        "NEVER ask what help they want. Not in any language -- not 'how can I "
+        "help', not 'मैं आपकी क्या मदद कर सकता हूँ', not 'మీరేమి సహాయం "
+        "చేయాలనుకుంటున్నారు'. They called to talk. If there is nothing "
+        "specific, just be good company: ask about their day, or follow the "
+        "thread they already started. Asking again after they have said they "
+        "want nothing is the single most irritating thing you can do. "
+        "If their sentence sounds cut off or trails away, do NOT answer it and "
+        "do NOT repeat yourself -- invite them to finish ('చెప్పండి, "
+        "వింటున్నాను', 'haan boliye') and wait. "
         "Say money and numbers the spoken way (Rs 1.50 is 'one rupee fifty', "
         "2026 is a year, not digits). "
         "Answer the latest user message only. Stay on-topic. No re-introductions. "
@@ -138,8 +147,13 @@ async def build_b2c_pipeline(
     # stop_secs is deliberately longer than the pipecat default (~0.8s):
     # Hindi/Telugu speakers pause mid-sentence, and aggressive silence-based
     # endpointing cuts them off. Tune this first if callers get clipped.
+    # stop_secs raised 1.1 -> 1.5. On a live call the caller was cut off
+    # mid-sentence ("...chicken తిన్నాను దాని తర్వాత" -- clearly continuing),
+    # and feeding the model a fragment is what triggered it to echo its own
+    # previous reply. Indian-language speakers pause mid-thought; the pipecat
+    # default of 0.2s is far too aggressive for this.
     vad_analyzer = SileroVADAnalyzer(
-        params=VADParams(stop_secs=1.1, start_secs=0.2, confidence=0.7)
+        params=VADParams(stop_secs=1.5, start_secs=0.2, confidence=0.7)
     )
 
     transport = FastAPIWebsocketTransport(
@@ -222,7 +236,9 @@ async def build_b2c_pipeline(
     )
 
     safety = SafetyGuardrailProcessor()
-    utterance_buffer = FullUtteranceBuffer()
+    utterance_buffer = FullUtteranceBuffer(
+        language_getter=lambda: profile.language or DEFAULT_LANGUAGE
+    )
     transcript_filter = TranscriptFilter(min_chars=2)
 
     # Per-call JSONL event log -- read by the /dashboard routes.

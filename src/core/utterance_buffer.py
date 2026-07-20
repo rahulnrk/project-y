@@ -53,6 +53,21 @@ def polish_for_speech(text: str, is_first: bool = True) -> str:
 
 _SENTENCE_END = re.compile(r"(?<=[\.!\?।…])\s")
 
+# When the model echoes its own previous reply, the caller has almost always
+# been cut off mid-thought -- so the right recovery is to invite them to
+# continue, not to say the same thing again. Rotated so the recovery itself
+# never becomes the new repetition.
+_CONTINUE_PHRASES = {
+    "te-IN": ["చెప్పండి, వింటున్నాను.", "అలాగా, ఆ తర్వాత?", "సరే, కొనసాగించండి."],
+    "hi-IN": ["Haan, boliye — sun raha hoon.", "Achha, phir kya hua?", "Ji, bataiye."],
+    "en-IN": ["Go on, I'm listening.", "Okay, and then?", "Sure, tell me more."],
+}
+
+
+def _normalize(text: str) -> str:
+    """Loose key for duplicate detection: case/space/punctuation insensitive."""
+    return re.sub(r"[^\w]+", "", (text or "").lower())
+
 # Minimum characters before the early first chunk is worth sending on its own.
 # Below this the network gap before the next chunk dominates and the reply
 # sounds broken rather than responsive.
@@ -72,8 +87,13 @@ class FullUtteranceBuffer(FrameProcessor):
     is unchanged; only the timing of the first audio frame moves.
     """
 
-    def __init__(self, max_sentences: int = 3):
+    def __init__(self, max_sentences: int = 3, language_getter=None):
         super().__init__()
+        # Callable returning the active language code, for recovery phrasing.
+        self._language_getter = language_getter
+        self._last_first_chunk = ""
+        self._suppress_rest = False
+        self._continue_idx = 0
         self._parts: list[str] = []
         self._in_response = False
         self._sent_count = 0
@@ -91,6 +111,19 @@ class FullUtteranceBuffer(FrameProcessor):
         self._parts = []
         self._sent_count = 0
         self._first_released = False
+        self._suppress_rest = False
+
+    def _continue_phrase(self) -> str:
+        lang = "hi-IN"
+        if self._language_getter:
+            try:
+                lang = self._language_getter() or "hi-IN"
+            except Exception:
+                pass
+        options = _CONTINUE_PHRASES.get(lang, _CONTINUE_PHRASES["hi-IN"])
+        phrase = options[self._continue_idx % len(options)]
+        self._continue_idx += 1
+        return phrase
 
     def _pending(self) -> str:
         """Collapse whitespace runs but PRESERVE a trailing space.
@@ -100,6 +133,32 @@ class FullUtteranceBuffer(FrameProcessor):
         run-together word. Only the leading side is safe to strip.
         """
         return re.sub(r"\s+", " ", "".join(self._parts)).lstrip()
+
+    async def _guard_repeat(self, opening: str, direction: FrameDirection) -> bool:
+        """If this reply opens exactly like the last one, speak a nudge instead.
+
+        Observed on a live call: with the correct history in context (including
+        its own previous reply and the caller's new message), the model still
+        regenerated its previous turn verbatim -- twice. frequency/presence
+        penalties did not prevent it. The trigger was a cut-off caller
+        utterance, so inviting them to continue is the right recovery.
+
+        Returns True if the reply was replaced.
+        """
+        key = _normalize(opening)
+        if key and key == self._last_first_chunk:
+            phrase = self._continue_phrase()
+            logger.warning(
+                f"FullUtteranceBuffer: model repeated its previous reply "
+                f"({opening[:60]!r}) -> substituting {phrase!r}"
+            )
+            self._suppress_rest = True
+            self._parts = []
+            self._sent_count += 1
+            await self.push_frame(LLMTextFrame(text=phrase + " "), direction)
+            return True
+        self._last_first_chunk = key
+        return False
 
     async def _emit(self, text: str, direction: FrameDirection):
         """Polish one chunk and push it downstream to TTS."""
@@ -148,14 +207,20 @@ class FullUtteranceBuffer(FrameProcessor):
                     sentence, remainder = pending[: match.end()], pending[match.end() :]
                     self._parts = [remainder]
                     self._first_released = True
+                    if await self._guard_repeat(sentence, direction):
+                        return
                     await self._emit(sentence, direction)
             return
 
         if isinstance(frame, LLMFullResponseEndFrame):
             self._in_response = False
-            # Flush the remainder as ONE chunk (cap total sentences spoken).
             tail = self._pending()
-            if tail:
+            if tail and not self._suppress_rest:
+                if not self._first_released and await self._guard_repeat(tail, direction):
+                    self._parts = []
+                    await self.push_frame(frame, direction)
+                    return
+                # Flush the remainder as ONE chunk (cap total sentences spoken).
                 parts = _SENTENCE_END.split(tail)
                 allowed = max(0, self._max_sentences - self._sent_count)
                 if allowed:
