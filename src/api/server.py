@@ -3,57 +3,76 @@ server.py - FastAPI WebSocket server for Exotel Voicebot
 Phase 1: B2C focused, architecture ready for B2B multi-tenancy
 """
 
-import json
-import os
 from fastapi import FastAPI, WebSocket
 
-from pipecat.serializers.exotel import ExotelFrameSerializer
-from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
+from pipecat.runner.utils import parse_telephony_websocket
 
-from ..config import WS_HOST, WS_PORT, EXOTEL_SAMPLE_RATE
+from ..config import WS_HOST, WS_PORT
 from ..core.pipeline import build_b2c_pipeline
 from ..memory.memory_store import MemoryStore
 
 app = FastAPI(title="AI Phone Assistant - B2C MVP")
 memory = MemoryStore()
 
+
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok", "phase": "B2C MVP", "languages": ["hi-IN", "te-IN", "en-IN"]}
 
 
-def _extract_phone_number(start_event: dict) -> str:
-    """Extract caller number from Exotel start event.
-    TODO: Verify exact key with real Exotel payload on first test call.
-    """
-    start = start_event.get("start", {})
-    custom = start.get("customParameters", {})
-    return (
-        custom.get("From") or 
-        custom.get("CallFrom") or 
-        start.get("from") or 
-        "unknown"
+def _phone_from_call_data(call_data) -> str:
+    """Normalize caller phone from Exotel parse result."""
+    # CallData supports both attribute and dict-style access
+    phone = (
+        getattr(call_data, "from_number", None)
+        or call_data.get("from")
+        or call_data.get("from_number")
+        or ""
     )
+    if not phone:
+        custom = call_data.get("custom_parameters") or {}
+        if isinstance(custom, dict):
+            phone = custom.get("From") or custom.get("CallFrom") or custom.get("from") or ""
+        elif isinstance(custom, str) and "from=" in custom.lower():
+            # e.g. "lead=42&from=9198..."
+            for part in custom.split("&"):
+                if "=" in part and part.split("=", 1)[0].lower() in ("from", "callfrom"):
+                    phone = part.split("=", 1)[1]
+                    break
+    return phone or "unknown"
 
 
 @app.websocket("/exotel-stream")
 async def exotel_stream(websocket: WebSocket):
     await websocket.accept()
 
-    # Read first message (Exotel "start" event)
-    start_event = json.loads(await websocket.receive_text())
-    stream_sid = start_event["start"]["streamSid"]
-    call_sid = start_event["start"].get("callSid")
-    phone_number = _extract_phone_number(start_event)
+    # Exotel sends: 1) {"event":"connected"} then 2) {"event":"start", "start":{...}}
+    # parse_telephony_websocket consumes both and returns typed call_data.
+    # Old code only read one message and crashed with KeyError: 'start'.
+    try:
+        transport_type, call_data = await parse_telephony_websocket(websocket)
+    except Exception as e:
+        print(f"[server] Failed to parse Exotel handshake: {e}")
+        await websocket.close()
+        return
 
-    print(f"[server] New call | stream_sid={stream_sid} | from={phone_number}")
+    stream_sid = call_data.get("stream_id") or call_data.get("stream_sid")
+    call_sid = call_data.get("call_id") or call_data.get("call_sid")
+    phone_number = _phone_from_call_data(call_data)
 
-    # Load / create profile immediately
+    print(
+        f"[server] New call | transport={transport_type} | "
+        f"stream_sid={stream_sid} | call_sid={call_sid} | from={phone_number}"
+    )
+
+    if not stream_sid:
+        print(f"[server] Missing stream_sid in call_data={call_data}; closing")
+        await websocket.close()
+        return
+
     profile = await memory.start_call(phone_number)
-
     print(f"[server] Profile loaded for {phone_number} | calls: {profile.total_calls}")
 
-    # Build and run the full Pipecat pipeline
     try:
         await build_b2c_pipeline(
             websocket=websocket,
@@ -65,13 +84,14 @@ async def exotel_stream(websocket: WebSocket):
         )
     except Exception as e:
         print(f"[server] Pipeline error: {e}")
+        import traceback
+
+        traceback.print_exc()
     finally:
-        # Graceful disconnect handling
-        # In production, we should cancel running PipelineTask and background tasks here
-        # to prevent memory leaks and wasted API calls on abrupt hang-ups.
-        print(f"[server] Call ended cleanly: {phone_number}")
+        print(f"[server] Call ended: {phone_number}")
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=WS_HOST, port=WS_PORT)

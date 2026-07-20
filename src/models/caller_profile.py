@@ -72,7 +72,14 @@ class CallerProfile:
         if self.personality and self.personality != "friendly":
             parts.append(f"Respond in a {self.personality} tone.")
         if self.language:
-            parts.append(f"Preferred language: {self.language}.")
+            _labels = {
+                "hi-IN": "Hindi (never Marathi)",
+                "te-IN": "Telugu",
+                "en-IN": "English",
+            }
+            parts.append(
+                f"Preferred language: {_labels.get(self.language, self.language)}."
+            )
 
         # Only include light, useful recent context
         if self.rolling_summary and len(self.rolling_summary) > 15:
