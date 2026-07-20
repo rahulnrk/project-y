@@ -69,6 +69,10 @@ _EPHEMERAL_PREFIXES = (
     CALL_CUE_PREFIX,
 )
 
+# Always dropped on the next turn regardless of length (search results can
+# exceed the 400-char "looks like a base prompt" guard below).
+_ALWAYS_EPHEMERAL_PREFIXES = ("LIVE SEARCH RESULTS",)
+
 
 def detect_language_request(text: str) -> Optional[str]:
     if not text:
@@ -97,6 +101,9 @@ def _scrub_ephemeral(messages: list) -> list:
 
         if role != "system":
             cleaned.append(m)
+            continue
+
+        if any(content.startswith(p) for p in _ALWAYS_EPHEMERAL_PREFIXES):
             continue
 
         if any(content.startswith(p) or p in content[:40] for p in _EPHEMERAL_PREFIXES):
@@ -176,6 +183,7 @@ class LanguageSwitchProcessor(FrameProcessor):
         self._current = profile.language or "hi-IN"
         self._pending_lang: str | None = None
         self._pending_count = 0
+        self.call_log = None  # optional CallLog, set by pipeline.py
 
     def _rewrite_context(self, extra_system: str | None = None):
         msgs = _scrub_ephemeral(list(self._context.get_messages()))
@@ -211,6 +219,8 @@ class LanguageSwitchProcessor(FrameProcessor):
         self._pending_lang = None
         self._pending_count = 0
         logger.info(f"Language switch → {target} ({why})")
+        if self.call_log is not None:
+            self.call_log.event("language_switch", to=target, why=why)
 
         # Persist the change in the base prompt, not an ephemeral note.
         self._rebuild_base_prompt()

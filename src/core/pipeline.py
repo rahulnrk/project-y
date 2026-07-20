@@ -36,6 +36,8 @@ from ..config import (
 )
 from ..guardrails.processor import SafetyGuardrailProcessor
 from ..memory.memory_store import MemoryStore, summarize_call
+from ..services.web_search import NewsInjectProcessor
+from ..utils.call_log import BotTurnTap, CallLog, UserTurnTap
 from ..utils.latency_tracker import LatencyTracker
 from ..utils.prompt_manager import get_prompt
 from .language_switch import CALL_CUE_PREFIX, LanguageSwitchProcessor
@@ -92,9 +94,16 @@ def _build_system_prompt(profile) -> str:
         "Say money and numbers the spoken way (Rs 1.50 is 'one rupee fifty', "
         "2026 is a year, not digits). "
         "Answer the latest user message only. Stay on-topic. No re-introductions. "
-        "You have no live internet access: if asked for today's news, prices or "
-        "anything current, say so plainly in one line and offer what you do know "
-        "-- never invent headlines, numbers or dates. "
+        "NEVER ask for their phone number -- you are already on a call with them "
+        "and the system knows their number. Never ask for OTPs, PINs, or IDs. "
+        "Never re-ask something the caller just told you, and never repeat your "
+        "previous reply -- each turn must move the conversation forward. If they "
+        "already answered your question, build on their answer. "
+        "CURRENT EVENTS: when a system message titled LIVE SEARCH RESULTS is "
+        "present, it is real fetched data -- answer from it naturally. When it "
+        "is absent and they ask for news, prices, scores or weather, say in one "
+        "line that you could not check right now -- never invent headlines, "
+        "numbers or dates. "
         "This is a mobile call in India, so audio may break up. If a message "
         "looks garbled or half-heard, do not guess: ask them warmly to say it "
         "once more, in their language, without sounding annoyed."
@@ -192,6 +201,11 @@ async def build_b2c_pipeline(
     utterance_buffer = FullUtteranceBuffer()
     transcript_filter = TranscriptFilter(min_chars=2)
 
+    # Per-call JSONL event log -- read by the /dashboard routes.
+    call_log = CallLog(call_sid=call_sid, phone_number=phone_number)
+    user_tap = UserTurnTap(call_log)
+    bot_tap = BotTurnTap(call_log)
+
     system_prompt = _build_system_prompt(profile)
     print(f"[pipeline] context-aware | lang={tts_language} | {_india_now_blob()}")
 
@@ -206,6 +220,7 @@ async def build_b2c_pipeline(
         stt_service=stt,
         system_prompt_builder=lambda: _build_system_prompt(profile),
     )
+    lang_switch.call_log = call_log
 
     context_aggregator = LLMContextAggregatorPair(
         context,
@@ -214,16 +229,24 @@ async def build_b2c_pipeline(
         ),
     )
 
+    # Live current-events data. Placed AFTER lang_switch so each turn's scrub
+    # (which drops last turn's LIVE SEARCH RESULTS) runs before fresh results
+    # are injected for this turn.
+    news_inject = NewsInjectProcessor(context, profile, aiohttp_session)
+
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             transcript_filter,
+            user_tap,               # log user turns + detected language
             lang_switch,
+            news_inject,
             safety,
             context_aggregator.user(),
             llm,
             utterance_buffer,
+            bot_tap,                # log bot speech
             tts,
             transport.output(),
             context_aggregator.assistant(),
@@ -273,7 +296,9 @@ async def build_b2c_pipeline(
     finally:
         await aiohttp_session.close()
 
-    print(f"[METRICS] Call ended for {phone_number} | {tracker.get_summary()}")
+    summary_metrics = tracker.get_summary()
+    call_log.event("call_ended", lang=profile.language, **summary_metrics)
+    print(f"[METRICS] Call ended for {phone_number} | {summary_metrics}")
 
     full_transcript = "\n".join(
         f"{m.get('role')}: {m.get('content')}"
