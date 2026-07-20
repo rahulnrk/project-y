@@ -81,8 +81,23 @@ def _build_system_prompt(profile) -> str:
 
     prompt += (
         f"\n\nACTIVE LANGUAGE: {lang_label} ({lang_code}). "
+        "Reply in the language the caller is currently speaking. If they switch "
+        "language mid-call, switch with them immediately and keep speaking that "
+        "language for the rest of the call -- do not drift back. Never announce "
+        "the switch. Keep technical, business and product words in English even "
+        "inside a Hindi or Telugu sentence; that is how bilingual Indians talk. "
         "ChatGPT-Voice style: precise, fluid, human. "
-        "Answer the latest user message only. Stay on-topic. No re-introductions."
+        "Answer in 1-2 short spoken sentences: give one point, then stop and let "
+        "them ask for more. Never read out a list of more than two items. "
+        "Say money and numbers the spoken way (Rs 1.50 is 'one rupee fifty', "
+        "2026 is a year, not digits). "
+        "Answer the latest user message only. Stay on-topic. No re-introductions. "
+        "You have no live internet access: if asked for today's news, prices or "
+        "anything current, say so plainly in one line and offer what you do know "
+        "-- never invent headlines, numbers or dates. "
+        "This is a mobile call in India, so audio may break up. If a message "
+        "looks garbled or half-heard, do not guess: ask them warmly to say it "
+        "once more, in their language, without sounding annoyed."
     )
     return prompt
 
@@ -125,15 +140,20 @@ async def build_b2c_pipeline(
 
     aiohttp_session = aiohttp.ClientSession()
 
-    # hi-IN + codemix is far more stable than language=unknown (which mis-tagged
-    # Punjabi/Malayalam and polluted context). Switch STT on language change.
-    stt_language = profile.language or DEFAULT_LANGUAGE
+    # Auto-detect, not pinned. Pinning to the profile language (hi-IN) meant a
+    # caller speaking Telugu or English was transcribed as Hindi, so the model
+    # never even saw the right words -- no prompt rule can recover from that.
+    # saaras:v3 takes language="unknown" for per-utterance detection.
+    #
+    # Auto-detect previously caused Punjabi/Malayalam mis-tags to pollute
+    # context. Two guards now contain that: LanguageSwitchProcessor only ever
+    # switches to hi/te/en, and requires consecutive agreeing detections.
     stt = SarvamSTTService(
         api_key=SARVAM_API_KEY,
         mode="codemix",
         settings=SarvamSTTService.Settings(
             model="saaras:v3",
-            language=stt_language,
+            language="unknown",
         ),
     )
 
@@ -177,8 +197,14 @@ async def build_b2c_pipeline(
 
     # ONE system message only (no sticky "ask name" injects)
     context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+    # Pass the builder (not the built string) so a mid-call switch regenerates
+    # the base prompt against the updated profile.language.
     lang_switch = LanguageSwitchProcessor(
-        profile, context, tts_service=tts, stt_service=stt
+        profile,
+        context,
+        tts_service=tts,
+        stt_service=stt,
+        system_prompt_builder=lambda: _build_system_prompt(profile),
     )
 
     context_aggregator = LLMContextAggregatorPair(
@@ -218,16 +244,20 @@ async def build_b2c_pipeline(
         # One-shot user cue — ChatGPT-Voice style natural open, not sticky system rule
         # Both branches MUST start with CALL_CUE_PREFIX so LanguageSwitchProcessor
         # can scrub this one-shot cue out of context after the first turn.
+        # Greeting language follows the profile instead of being hardcoded Hindi.
+        greet_lang = _LANG_LABELS.get(profile.language or DEFAULT_LANGUAGE, "Hindi")
         if not profile.name or profile.total_calls <= 1:
             cue = (
-                f"{CALL_CUE_PREFIX} Open like ChatGPT Voice: warm natural Hindi, one fluid line — "
-                "you're Sahaay, ask my name casually. Sound human, not IVR. Never re-introduce later.)"
+                f"{CALL_CUE_PREFIX} Open like ChatGPT Voice: warm natural {greet_lang}, "
+                "one short fluid line — you're Sahaay, ask my name casually. Sound human, "
+                "not IVR. Never re-introduce later.)"
             )
         else:
             name = profile.name or "dost"
             cue = (
-                f"{CALL_CUE_PREFIX} Open like ChatGPT Voice: warm natural Hindi greeting for {name}, "
-                f"one fluid line, ready to listen. Human, not IVR. No re-intro later.)"
+                f"{CALL_CUE_PREFIX} Open like ChatGPT Voice: warm natural {greet_lang} greeting "
+                f"for {name}, one short fluid line, ready to listen. Human, not IVR. "
+                f"No re-intro later.)"
             )
         context.add_message({"role": "user", "content": cue})
         await task.queue_frames([LLMRunFrame()])

@@ -131,14 +131,51 @@ def _trim_history(messages: list, max_turns: int = 8) -> list:
     return base + collapsed
 
 
+# Languages we actually support end-to-end. STT auto-detect will sometimes
+# mis-tag Indic audio as Punjabi/Malayalam/Marathi; those must never trigger a
+# switch, otherwise one bad frame drags the whole call into a language neither
+# side wanted. Anything outside this set is ignored.
+SUPPORTED_SWITCH_LANGS = ("hi-IN", "te-IN", "en-IN")
+
+# Consecutive detections required before following the caller implicitly.
+# An explicit request ("speak English") switches immediately; drifting on a
+# single auto-detected frame is what caused earlier language thrash.
+_IMPLICIT_SWITCH_THRESHOLD = 2
+
+
 class LanguageSwitchProcessor(FrameProcessor):
-    def __init__(self, profile, context, tts_service=None, stt_service=None):
+    """Keeps STT, TTS, and the system prompt agreed on one active language.
+
+    Two paths in:
+      - explicit ("bolo English mein")     -> switch immediately
+      - implicit (caller just speaks Telugu) -> switch after N consistent
+        auto-detected frames
+
+    The switch rewrites the *base* system prompt rather than appending a note.
+    Appending was the bug: the note began "LANGUAGE SWITCH:" and was under 400
+    chars, so _scrub_ephemeral deleted it on the very next turn and the base
+    prompt -- which still pinned the original language -- took over again. That
+    is why the bot said "yes, English" and then immediately reverted to Hindi.
+    """
+
+    def __init__(
+        self,
+        profile,
+        context,
+        tts_service=None,
+        stt_service=None,
+        system_prompt_builder=None,
+    ):
         super().__init__()
         self._profile = profile
         self._context = context
         self._tts = tts_service
         self._stt = stt_service
+        # Callable returning the full base system prompt for profile.language.
+        self._build_system_prompt = system_prompt_builder
         self._current = profile.language or "hi-IN"
+        self._pending_lang: str | None = None
+        self._pending_count = 0
 
     def _rewrite_context(self, extra_system: str | None = None):
         msgs = _scrub_ephemeral(list(self._context.get_messages()))
@@ -147,6 +184,49 @@ class LanguageSwitchProcessor(FrameProcessor):
             msgs.append({"role": "system", "content": extra_system})
         self._context.set_messages(msgs)
 
+    def _rebuild_base_prompt(self):
+        """Replace the base system prompt so the new language persists."""
+        if not self._build_system_prompt:
+            return
+        msgs = _scrub_ephemeral(list(self._context.get_messages()))
+        msgs = _trim_history(msgs, max_turns=8)
+        rebuilt = self._build_system_prompt()
+        if msgs and msgs[0].get("role") == "system":
+            msgs[0] = {"role": "system", "content": rebuilt}
+        else:
+            msgs.insert(0, {"role": "system", "content": rebuilt})
+        self._context.set_messages(msgs)
+
+    def _detected_code(self, frame) -> str | None:
+        """Normalize TranscriptionFrame.language (a Language enum) to a code."""
+        lang = getattr(frame, "language", None)
+        if lang is None:
+            return None
+        code = getattr(lang, "value", None) or str(lang)
+        return code if code in SUPPORTED_SWITCH_LANGS else None
+
+    async def _apply_switch(self, target: str, direction: FrameDirection, why: str):
+        self._current = target
+        self._profile.language = target
+        self._pending_lang = None
+        self._pending_count = 0
+        logger.info(f"Language switch → {target} ({why})")
+
+        # Persist the change in the base prompt, not an ephemeral note.
+        self._rebuild_base_prompt()
+
+        await self.push_frame(
+            TTSUpdateSettingsFrame(settings={"language": target}, service=self._tts),
+            direction,
+        )
+        if self._stt is not None:
+            # Sarvam bakes language_code into the STT websocket connect, so this
+            # triggers a reconnect internally (see sarvam/stt.py _update_settings).
+            await self.push_frame(
+                STTUpdateSettingsFrame(settings={"language": target}, service=self._stt),
+                direction,
+            )
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
@@ -154,33 +234,26 @@ class LanguageSwitchProcessor(FrameProcessor):
             # Always scrub sticky injects + trim history before each user turn
             self._rewrite_context()
 
+            # 1. Explicit request wins outright.
             requested = detect_language_request(frame.text)
             if requested and requested != self._current:
-                self._current = requested
-                self._profile.language = requested
-                label = _LABELS[requested]
-                logger.info(f"Language switch → {requested}")
-                self._rewrite_context(
-                    extra_system=(
-                        f"LANGUAGE SWITCH: Speak ONLY {label} from now on. "
-                        f"Acknowledge in one short phrase in {label}. "
-                        f"Do not re-introduce yourself. Answer their next message on-topic."
-                    )
-                )
-                await self.push_frame(
-                    TTSUpdateSettingsFrame(
-                        settings={"language": requested},
-                        service=self._tts,
-                    ),
-                    direction,
-                )
-                if self._stt is not None:
-                    await self.push_frame(
-                        STTUpdateSettingsFrame(
-                            settings={"language": requested},
-                            service=self._stt,
-                        ),
-                        direction,
-                    )
+                await self._apply_switch(requested, direction, "explicit request")
+                await self.push_frame(frame, direction)
+                return
+
+            # 2. Otherwise follow the language the caller is actually speaking.
+            if not requested:
+                detected = self._detected_code(frame)
+                if detected and detected != self._current:
+                    if detected == self._pending_lang:
+                        self._pending_count += 1
+                    else:
+                        self._pending_lang = detected
+                        self._pending_count = 1
+                    if self._pending_count >= _IMPLICIT_SWITCH_THRESHOLD:
+                        await self._apply_switch(detected, direction, "caller's speech")
+                elif detected == self._current:
+                    self._pending_lang = None
+                    self._pending_count = 0
 
         await self.push_frame(frame, direction)
