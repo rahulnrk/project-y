@@ -129,10 +129,21 @@ def _trim_history(messages: list, max_turns: int = 8) -> list:
             and collapsed[-1].get("role") == "user"
             and m.get("role") == "user"
         ):
-            collapsed[-1] = {
-                "role": "user",
-                "content": (collapsed[-1].get("content") or "") + " " + (m.get("content") or ""),
-            }
+            prev = (collapsed[-1].get("content") or "").strip()
+            cur = (m.get("content") or "").strip()
+            # Blind concatenation produced garbled duplicates in a live call
+            # ("Like your voice is loud enough Your voice is loud enough but")
+            # when STT re-sent an overlapping partial. Keep the longer one when
+            # either contains the other; only join genuinely distinct text.
+            if not prev:
+                merged = cur
+            elif not cur or cur in prev:
+                merged = prev
+            elif prev in cur:
+                merged = cur
+            else:
+                merged = f"{prev} {cur}"
+            collapsed[-1] = {"role": "user", "content": merged}
         else:
             collapsed.append(m)
     return base + collapsed
@@ -148,6 +159,9 @@ SUPPORTED_SWITCH_LANGS = ("hi-IN", "te-IN", "en-IN")
 # An explicit request ("speak English") switches immediately; drifting on a
 # single auto-detected frame is what caused earlier language thrash.
 _IMPLICIT_SWITCH_THRESHOLD = 2
+
+# Minimum utterance length before auto-detected language counts as intent.
+_MIN_CHARS_FOR_IMPLICIT = 12
 
 
 class LanguageSwitchProcessor(FrameProcessor):
@@ -252,7 +266,10 @@ class LanguageSwitchProcessor(FrameProcessor):
                 return
 
             # 2. Otherwise follow the language the caller is actually speaking.
-            if not requested:
+            # Short utterances are unreliable language signals -- a live call
+            # flipped to en-IN on "I'm Rahul" and back to hi-IN a turn later.
+            # Require some substance before treating detection as intent.
+            if not requested and len(frame.text.strip()) >= _MIN_CHARS_FOR_IMPLICIT:
                 detected = self._detected_code(frame)
                 if detected and detected != self._current:
                     if detected == self._pending_lang:

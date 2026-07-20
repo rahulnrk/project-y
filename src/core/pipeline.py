@@ -89,8 +89,15 @@ def _build_system_prompt(profile) -> str:
         "the switch. Keep technical, business and product words in English even "
         "inside a Hindi or Telugu sentence; that is how bilingual Indians talk. "
         "ChatGPT-Voice style: precise, fluid, human. "
-        "Answer in 1-2 short spoken sentences: give one point, then stop and let "
-        "them ask for more. Never read out a list of more than two items. "
+        "LENGTH: two or three natural spoken sentences is the sweet spot. Be "
+        "brief, never blunt -- a bare one-word reply like 'Sahaay.' or 'Rahul.' "
+        "sounds cold and robotic. Answer, then add one short piece of substance "
+        "or a natural follow-up, the way a friend would. Never read out a list "
+        "of more than two items. "
+        "If the caller says they cannot hear you, your voice is breaking, or "
+        "asks you to repeat: apologise ONCE in your own words, then actually "
+        "repeat your last point more slowly and clearly. Never reply with the "
+        "same apology twice -- that is what makes you sound broken. "
         "Say money and numbers the spoken way (Rs 1.50 is 'one rupee fifty', "
         "2026 is a year, not digits). "
         "Answer the latest user message only. Stay on-topic. No re-introductions. "
@@ -142,7 +149,9 @@ async def build_b2c_pipeline(
             audio_in_enabled=True,
             audio_out_enabled=True,
             add_wav_header=False,
-            audio_out_10ms_chunks=8,
+            # 4 x 10ms = 40ms (pipecat default). Was 8 (80ms), which delivers
+            # audio in larger bursts and reads as choppy on a mobile network.
+            audio_out_10ms_chunks=4,
             vad_analyzer=vad_analyzer,
         ),
     )
@@ -179,7 +188,12 @@ async def build_b2c_pipeline(
             model="bulbul:v2",
             language=tts_language,
             pace=0.96,
-            loudness=1.9,
+            # loudness was 1.9 (range is 0.3-3.0, neutral 1.0). Measured against
+            # the live API on a sample line: 1.9 -> 815 hard-clipped samples at
+            # 22kHz and 266 surviving the 8kHz downsample; 1.0 -> 2 and 0.
+            # Clipping is what makes the voice sound distorted / "not clear" on
+            # a phone, and it gets worse through telephony resampling.
+            loudness=1.0,
             pitch=0.0,
             enable_preprocessing=True,
         ),
@@ -191,9 +205,19 @@ async def build_b2c_pipeline(
         base_url=SARVAM_LLM_BASE_URL,
         settings=SarvamLLMService.Settings(
             model=SARVAM_LLM_MODEL,
-            max_tokens=180,
-            temperature=0.45,
-            extra={"reasoning_effort": None},
+            max_tokens=220,
+            temperature=0.6,
+            extra={
+                "reasoning_effort": None,
+                # On a live call the model repeated "Oh, sorry about that."
+                # verbatim across four turns and "Hmm, क्या बात है?" across
+                # three -- with the full history visible in context, so it was
+                # ignoring the prompt's anti-repetition rule. Penalties enforce
+                # variety at decode time instead of asking nicely. Verified
+                # accepted by the Sarvam OpenAI-compatible endpoint.
+                "frequency_penalty": 0.5,
+                "presence_penalty": 0.4,
+            },
         ),
     )
 

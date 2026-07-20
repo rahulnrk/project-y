@@ -53,6 +53,11 @@ def polish_for_speech(text: str, is_first: bool = True) -> str:
 
 _SENTENCE_END = re.compile(r"(?<=[\.!\?।…])\s")
 
+# Minimum characters before the early first chunk is worth sending on its own.
+# Below this the network gap before the next chunk dominates and the reply
+# sounds broken rather than responsive.
+_MIN_FIRST_CHUNK_CHARS = 25
+
 
 class FullUtteranceBuffer(FrameProcessor):
     """Emit the first complete sentence early, then stream the remainder.
@@ -73,10 +78,19 @@ class FullUtteranceBuffer(FrameProcessor):
         self._in_response = False
         self._sent_count = 0
         self._max_sentences = max_sentences
+        # Release the FIRST sentence early, then batch the rest into one chunk.
+        #
+        # SarvamHttpTTSService issues a separate HTTP request per text frame, so
+        # emitting every sentence separately put a real network gap between them
+        # -- measured 317-729ms of silence mid-reply on a live call, which the
+        # caller heard as the voice "breaking". One early chunk plus one batched
+        # chunk keeps fast time-to-first-audio with at most a single seam.
+        self._first_released = False
 
     def _reset(self):
         self._parts = []
         self._sent_count = 0
+        self._first_released = False
 
     def _pending(self) -> str:
         """Collapse whitespace runs but PRESERVE a trailing space.
@@ -121,26 +135,31 @@ class FullUtteranceBuffer(FrameProcessor):
             if piece:
                 self._parts.append(piece)
 
-            # Release each complete sentence as soon as it lands, so TTS can
-            # start speaking while the LLM is still generating.
-            while self._sent_count < self._max_sentences:
+            # Release ONLY the first sentence early, so TTS starts speaking
+            # while the LLM is still generating. Everything after it is held
+            # and flushed as a single chunk at end of response.
+            if not self._first_released:
                 pending = self._pending()
                 match = _SENTENCE_END.search(pending)
-                if not match:
-                    break
-                sentence, remainder = pending[: match.end()], pending[match.end() :]
-                self._parts = [remainder]
-                await self._emit(sentence, direction)
+                # Don't release a tiny fragment like "Namaste!" on its own --
+                # the seam then lands immediately and sounds like a stutter.
+                # Wait until the early chunk carries real content.
+                if match and match.end() >= _MIN_FIRST_CHUNK_CHARS:
+                    sentence, remainder = pending[: match.end()], pending[match.end() :]
+                    self._parts = [remainder]
+                    self._first_released = True
+                    await self._emit(sentence, direction)
             return
 
         if isinstance(frame, LLMFullResponseEndFrame):
             self._in_response = False
-            # Trailing text with no terminal punctuation, or a reply short
-            # enough that no boundary was ever hit.
-            if self._sent_count < self._max_sentences:
-                tail = self._pending()
-                if tail:
-                    await self._emit(tail, direction)
+            # Flush the remainder as ONE chunk (cap total sentences spoken).
+            tail = self._pending()
+            if tail:
+                parts = _SENTENCE_END.split(tail)
+                allowed = max(0, self._max_sentences - self._sent_count)
+                if allowed:
+                    await self._emit(" ".join(parts[:allowed]), direction)
             self._parts = []
             await self.push_frame(frame, direction)
             return
